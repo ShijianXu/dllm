@@ -29,6 +29,10 @@ class MDLMSamplerConfig(BaseSamplerConfig):
     suppress_tokens: list[int] | None = None
     begin_suppress_tokens: list[int] | None = None
     right_shift_logits: bool = False
+    # DOS (Dependency-Oriented Sampler): index of the transformer block whose
+    # attention matrix is used for dependency scoring when remasking="attention_dependency".
+    # -1 selects the last layer; any valid layer index is accepted.
+    attention_layer_idx: int = -1
 
 
 @dataclass
@@ -75,6 +79,7 @@ class MDLMSampler(BaseSampler):
         begin_suppress_tokens = kwargs.get(
             "begin_suppress_tokens", config.begin_suppress_tokens
         )
+        attention_layer_idx = kwargs.get("attention_layer_idx", config.attention_layer_idx)
 
         assert 1 <= block_size
         assert 1 <= steps
@@ -162,19 +167,28 @@ class MDLMSampler(BaseSampler):
                 mask_index = x == mask_id  # current global mask map
 
                 # Optional CFG: second forward where original prompt tokens are masked out
+                need_attentions = remasking == "attention_dependency"
                 if cfg_scale > 0.0:
                     un_x = x.clone()
                     un_x[unmasked_index] = mask_id
                     x_ = torch.cat([x, un_x], dim=0)
-                    logits = self.model(
-                        x_, attention_mask=attention_mask.repeat(2, 1)
-                    ).logits
-                    logits, un_logits = torch.chunk(logits, 2, dim=0)
+                    _out = self.model(
+                        x_, attention_mask=attention_mask.repeat(2, 1),
+                        output_attentions=need_attentions,
+                    )
+                    logits, un_logits = torch.chunk(_out.logits, 2, dim=0)
                     logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
+                    if need_attentions:
+                        # Conditional attentions are the first half of the combined batch
+                        _attn_weights = _out.attentions[attention_layer_idx][:B]  # [B, H, L, L]
                 else:
-                    logits = self.model(
-                        x, attention_mask=attention_mask
-                    ).logits  # Use attention mask here
+                    _out = self.model(
+                        x, attention_mask=attention_mask,
+                        output_attentions=need_attentions,
+                    )
+                    logits = _out.logits
+                    if need_attentions:
+                        _attn_weights = _out.attentions[attention_layer_idx]  # [B, H, L, L]
 
                 if suppress_tokens is not None and len(suppress_tokens) > 0:
                     for token_id in suppress_tokens:
@@ -203,6 +217,14 @@ class MDLMSampler(BaseSampler):
                     x0_p = torch.rand(
                         (x0.shape[0], x0.shape[1]), device=x0.device
                     )  # random scores
+                elif remasking == "attention_dependency":
+                    # DOS: Attention-Based Dependency Scoring (Algorithm 1)
+                    # Average attention over heads: [B, H, L, L] -> [B, L, L]
+                    attn = _attn_weights.mean(dim=1)
+                    # U = currently unmasked and valid positions
+                    unmasked_pos = (~mask_index) & attention_mask.bool()  # [B, L]
+                    # dep(m) = sum_{u in U} Attn(m, u): sum attn from each pos to unmasked context
+                    x0_p = (attn * unmasked_pos.float().unsqueeze(1)).sum(dim=-1)  # [B, L]
                 else:
                     raise NotImplementedError(remasking)
 
@@ -269,6 +291,7 @@ class MDLMSampler(BaseSampler):
         begin_suppress_tokens = kwargs.get(
             "begin_suppress_tokens", config.begin_suppress_tokens
         )
+        attention_layer_idx = kwargs.get("attention_layer_idx", config.attention_layer_idx)
 
         mask_id = self.tokenizer.mask_token_id
         bos_id = self.tokenizer.bos_token_id
@@ -353,19 +376,28 @@ class MDLMSampler(BaseSampler):
                 mask_index_full = x == mask_id
 
                 # ----- Forward pass (+ optional CFG) -----
+                need_attentions = remasking == "attention_dependency"
                 if cfg_scale > 0.0:
                     un_x = x.clone()
                     un_x[unmasked_index] = mask_id
                     x_ = torch.cat([x, un_x], dim=0)
-                    logits = self.model(
-                        x_, attention_mask=attention_mask.repeat(2, 1)
-                    ).logits
-                    logits, un_logits = torch.chunk(logits, 2, dim=0)
+                    _out = self.model(
+                        x_, attention_mask=attention_mask.repeat(2, 1),
+                        output_attentions=need_attentions,
+                    )
+                    logits, un_logits = torch.chunk(_out.logits, 2, dim=0)
                     logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
+                    if need_attentions:
+                        # Conditional attentions are the first half of the combined batch
+                        _attn_weights = _out.attentions[attention_layer_idx][:B]  # [B, H, L, L]
                 else:
-                    logits = self.model(
-                        x, attention_mask=attention_mask
-                    ).logits  # Use attention mask here
+                    _out = self.model(
+                        x, attention_mask=attention_mask,
+                        output_attentions=need_attentions,
+                    )
+                    logits = _out.logits
+                    if need_attentions:
+                        _attn_weights = _out.attentions[attention_layer_idx]  # [B, H, L, L]
 
                 if suppress_tokens is not None and len(suppress_tokens) > 0:
                     for token_id in suppress_tokens:
@@ -390,6 +422,15 @@ class MDLMSampler(BaseSampler):
                     )  # [B, T]
                 elif remasking == "random":
                     x0_p = torch.rand((B, T), device=self.model.device)
+                
+                elif remasking == "attention_dependency":
+                    # DOS: Attention-Based Dependency Scoring (Algorithm 1)
+                    # Average attention over heads: [B, H, L, L] -> [B, L, L]
+                    attn = _attn_weights.mean(dim=1)
+                    # U = currently unmasked and valid positions
+                    unmasked_pos = (~mask_index_full) & attention_mask.bool()  # [B, L]
+                    # dep(m) = sum_{u in U} Attn(m, u): sum attn from each pos to unmasked context
+                    x0_p = (attn * unmasked_pos.float().unsqueeze(1)).sum(dim=-1)  # [B, L]
                 else:
                     raise NotImplementedError(remasking)
 

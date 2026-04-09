@@ -172,6 +172,19 @@ accelerate launch --num_processes 4 \
     --model_args "pretrained=GSAI-ML/LLaDA-8B-Instruct,max_new_tokens=512,steps=512,block_size=512,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348]"
 ```
 
+To evaluate LLaDA-8B-Instruct on gsm8k using 1 GPU with attention dependency (DOS), run:
+```shell
+accelerate launch --num_processes 1 \
+    dllm/pipelines/llada/eval.py \
+    --tasks "gsm8k_cot" \
+    --model "llada" \
+    --apply_chat_template \
+    --num_fewshot 5 \
+    --model_args "pretrained=GSAI-ML/LLaDA-8B-Instruct,max_new_tokens=512,steps=512,block_size=512,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],remasking=attention_dependency,attention_layer_idx=-1"
+```
+
+
+
 To automatically evaluate [`LLaDA-8B-Base`](https://huggingface.co/GSAI-ML/LLaDA-8B-Base) and [`LLaDA-8B-Instruct`](https://huggingface.co/GSAI-ML/LLaDA-8B-Instruct) on all benchmarks, run:
 ```shell
 bash examples/llada/eval.sh --model_name_or_path GSAI-ML/LLaDA-8B-Instruct --instruct True
