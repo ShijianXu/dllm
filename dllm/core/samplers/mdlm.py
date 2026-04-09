@@ -79,7 +79,7 @@ class MDLMSampler(BaseSampler):
         begin_suppress_tokens = kwargs.get(
             "begin_suppress_tokens", config.begin_suppress_tokens
         )
-        attention_layer_idx = kwargs.get("attention_layer_idx", config.attention_layer_idx)
+        attention_layer_idx = int(kwargs.get("attention_layer_idx", config.attention_layer_idx))
 
         assert 1 <= block_size
         assert 1 <= steps
@@ -291,7 +291,7 @@ class MDLMSampler(BaseSampler):
         begin_suppress_tokens = kwargs.get(
             "begin_suppress_tokens", config.begin_suppress_tokens
         )
-        attention_layer_idx = kwargs.get("attention_layer_idx", config.attention_layer_idx)
+        attention_layer_idx = int(kwargs.get("attention_layer_idx", config.attention_layer_idx))
 
         mask_id = self.tokenizer.mask_token_id
         bos_id = self.tokenizer.bos_token_id
