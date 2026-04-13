@@ -194,7 +194,7 @@ class ClusterGuidedSampler(BaseSampler):
         if not valid_cluster.any():
             return logits
 
-        safe_counts = anchor_counts.float().clamp(min=1.0).unsqueeze(1)  # [k_actual, 1]
+        safe_counts = anchor_counts.to(centroid_sum.dtype).clamp(min=1.0).unsqueeze(1)  # [k_actual, 1]
         centroids   = centroid_sum / safe_counts                           # [k_actual, d]
 
         # ---- Step 3: apply output norm + LM head (single batched call) ------
