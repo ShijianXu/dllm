@@ -5,7 +5,7 @@ accelerate launch --num_processes 1 \
     --model "llada_cluster" \
     --apply_chat_template \
     --num_fewshot 5 \
-    --model_args "pretrained=GSAI-ML/LLaDA-8B-Instruct,max_new_tokens=512,steps=512,block_size=512,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],n_clusters=8,gamma_alpha=1.0,gamma_beta=1.0,min_anchor_size=1"
+    --model_args "pretrained=GSAI-ML/LLaDA-8B-Instruct,max_new_tokens=512,steps=512,block_size=512,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],n_clusters=8,gamma_alpha=1.0,gamma_beta=1.0,min_anchor_size=1,cluster_every_n_steps=8"
 """
 
 from dataclasses import dataclass

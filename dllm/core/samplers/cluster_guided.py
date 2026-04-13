@@ -395,8 +395,11 @@ class ClusterGuidedSampler(BaseSampler):
                 # Gate expensive outputs: only request hidden states / attentions
                 # when guidance is active.  Attentions are only needed when we
                 # are actually going to re-run spectral clustering this step.
+                # Force a recluster whenever any sample's cache is still empty
+                # (e.g. step 0 had gamma=0 so clustering was skipped entirely).
                 need_guidance  = gamma > 0.0
-                recluster_now  = need_guidance and (i % cluster_every_n_steps == 0)
+                cache_empty    = any(cl is None for cl in cached_labels)
+                recluster_now  = need_guidance and (i % cluster_every_n_steps == 0 or cache_empty)
                 need_hidden    = need_guidance
                 need_attn      = recluster_now
 
