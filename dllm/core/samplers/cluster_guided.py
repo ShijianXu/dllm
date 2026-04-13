@@ -53,6 +53,11 @@ class ClusterGuidedSamplerConfig(BaseSamplerConfig):
     # Minimum number of already-decoded tokens in a cluster before
     # guidance is computed (avoids noise from tiny anchor sets).
     min_anchor_size: int = 1
+    # Re-run spectral clustering only every N decoding steps.
+    # Between reclusters the cached labels from the last cluster run are reused,
+    # avoiding an O(L³) eigendecomposition every step.  Set to 1 to recluster
+    # every step (original behaviour).
+    cluster_every_n_steps: int = 8
 
 
 # ---------------------------------------------------------------------------
@@ -134,20 +139,23 @@ class ClusterGuidedSampler(BaseSampler):
 
     def _compute_guidance_logits(
         self,
-        hidden: torch.Tensor,        # [L, d]  last-layer hidden states (one sample)
-        logits: torch.Tensor,        # [L, V]  original logits (one sample)
-        attn: torch.Tensor,          # [L, L]  head-averaged attention (one sample)
-        mask_index: torch.Tensor,    # [L]     bool, True = still masked
+        hidden: torch.Tensor,                   # [L, d]  last-layer hidden states (one sample)
+        logits: torch.Tensor,                   # [L, V]  original logits (one sample)
+        mask_index: torch.Tensor,               # [L]     bool, True = still masked
         valid_len: int,
         n_clusters: int,
         min_anchor_size: int,
         gamma: float,
-    ) -> torch.Tensor:
+        attn: torch.Tensor | None = None,       # [L, L]  head-averaged attention; required when cached_labels is None
+        cached_labels: np.ndarray | None = None,  # reuse labels from a prior step
+    ) -> tuple[torch.Tensor, np.ndarray]:
         """
         Compute and inject guidance logits for all masked positions in one sample.
 
         Pipeline (per sample):
-          1. Spectral-cluster the valid token positions using the attention map.
+          1. Spectral-cluster the valid token positions using the attention map,
+             OR reuse `cached_labels` from a recent step to skip the O(L³)
+             eigendecomposition.
           2. For each cluster, average the hidden states of already-decoded tokens
              via scatter-add → centroid h̄_c.
           3. Apply the model's final layer norm (if present), then pass all
@@ -155,15 +163,21 @@ class ClusterGuidedSampler(BaseSampler):
           4. For every masked position i whose cluster has a valid centroid:
                l̂_i = l_i + γ · g_{C(i)}
 
-        Returns the biased logits tensor (same shape as `logits`).
+        Returns (guided_logits, cluster_labels_np) so the caller can cache
+        the labels for the next N-1 steps.
         """
         if gamma == 0.0:
-            return logits
+            dummy = cached_labels if cached_labels is not None else np.zeros(valid_len, dtype=np.int64)
+            return logits, dummy
 
         # ---- Step 1: cluster assignment [valid_len] -------------------------
-        cluster_labels_np = self._spectral_cluster(
-            attn[:valid_len, :valid_len], n_clusters, valid_len
-        )
+        if cached_labels is not None:
+            cluster_labels_np = cached_labels
+        else:
+            assert attn is not None, "_compute_guidance_logits: attn must be provided when cached_labels is None"
+            cluster_labels_np = self._spectral_cluster(
+                attn[:valid_len, :valid_len], n_clusters, valid_len
+            )
         labels   = torch.from_numpy(cluster_labels_np).to(hidden.device)  # [valid_len]
         k_actual = int(labels.max().item()) + 1   # number of clusters actually used
 
@@ -192,7 +206,7 @@ class ClusterGuidedSampler(BaseSampler):
         # Only use clusters that have at least min_anchor_size decoded tokens
         valid_cluster = anchor_counts >= min_anchor_size           # [k_actual] bool
         if not valid_cluster.any():
-            return logits
+            return logits, cluster_labels_np
 
         safe_counts = anchor_counts.to(centroid_sum.dtype).clamp(min=1.0).unsqueeze(1)  # [k_actual, 1]
         centroids   = centroid_sum / safe_counts                           # [k_actual, d]
@@ -206,7 +220,7 @@ class ClusterGuidedSampler(BaseSampler):
         guided_cluster_ids    = masked_cluster_labels[has_guidance] # [M]
 
         if guided_pos.numel() == 0:
-            return logits
+            return logits, cluster_labels_np
 
         # One centroid per guided masked position: [M, d]
         centroid_stack = centroids[guided_cluster_ids]
@@ -223,7 +237,7 @@ class ClusterGuidedSampler(BaseSampler):
         guided_logits = logits.clone()
         guided_logits[guided_pos] = logits[guided_pos] + gamma * guidance
 
-        return guided_logits
+        return guided_logits, cluster_labels_np
 
     # ------------------------------------------------------------------
     # LM-head accessor
@@ -294,11 +308,12 @@ class ClusterGuidedSampler(BaseSampler):
         return_dict         = kwargs.get("return_dict",         config.return_dict)
         right_shift_logits  = kwargs.get("right_shift_logits",  config.right_shift_logits)
         
-        cluster_attn_layer  = int(kwargs.get("cluster_attention_layer_idx", config.cluster_attention_layer_idx))
-        n_clusters          = int(kwargs.get("n_clusters",          config.n_clusters))
-        gamma_alpha         = float(kwargs.get("gamma_alpha",        config.gamma_alpha))
-        gamma_beta          = float(kwargs.get("gamma_beta",         config.gamma_beta))
-        min_anchor_size     = int(kwargs.get("min_anchor_size",      config.min_anchor_size))
+        cluster_attn_layer    = int(kwargs.get("cluster_attention_layer_idx", config.cluster_attention_layer_idx))
+        n_clusters            = int(kwargs.get("n_clusters",            config.n_clusters))
+        gamma_alpha           = float(kwargs.get("gamma_alpha",          config.gamma_alpha))
+        gamma_beta            = float(kwargs.get("gamma_beta",           config.gamma_beta))
+        min_anchor_size       = int(kwargs.get("min_anchor_size",        config.min_anchor_size))
+        cluster_every_n_steps = int(kwargs.get("cluster_every_n_steps",  config.cluster_every_n_steps))
 
         assert 1 <= block_size
         assert 1 <= steps
@@ -367,15 +382,25 @@ class ClusterGuidedSampler(BaseSampler):
             )
             effective_steps = num_transfer_tokens.size(1)
 
+            # Per-sample cluster-label cache; reset at the start of each block
+            # so that a new block (different token window) always reclusters.
+            cached_labels: list[np.ndarray | None] = [None] * B
+
             for i in range(effective_steps):
                 mask_index = x == mask_id  # [B, T]
 
                 # γ(t): t goes from 0..effective_steps-1
                 gamma = self._gamma(i, effective_steps, gamma_alpha, gamma_beta)
 
+                # Gate expensive outputs: only request hidden states / attentions
+                # when guidance is active.  Attentions are only needed when we
+                # are actually going to re-run spectral clustering this step.
+                need_guidance  = gamma > 0.0
+                recluster_now  = need_guidance and (i % cluster_every_n_steps == 0)
+                need_hidden    = need_guidance
+                need_attn      = recluster_now
+
                 # ---- forward pass ----
-                need_hidden   = True   # always needed for guidance
-                need_attn     = True   # needed for clustering
                 if cfg_scale > 0.0:
                     un_x = x.clone()
                     un_x[unmasked_index] = mask_id
@@ -388,8 +413,8 @@ class ClusterGuidedSampler(BaseSampler):
                     )
                     logits, un_logits = torch.chunk(_out.logits, 2, dim=0)
                     logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
-                    hidden_states = _out.hidden_states[-1][:B]    # [B, T, d]
-                    attn_weights  = _out.attentions[cluster_attn_layer][:B]  # [B, H, T, T]
+                    hidden_states = _out.hidden_states[-1][:B] if need_hidden else None   # [B, T, d]
+                    attn_weights  = _out.attentions[cluster_attn_layer][:B] if need_attn else None  # [B, H, T, T]
                 else:
                     _out = self.model(
                         x,
@@ -397,9 +422,9 @@ class ClusterGuidedSampler(BaseSampler):
                         output_hidden_states=need_hidden,
                         output_attentions=need_attn,
                     )
-                    logits        = _out.logits                     # [B, T, V]
-                    hidden_states = _out.hidden_states[-1]          # [B, T, d]
-                    attn_weights  = _out.attentions[cluster_attn_layer]  # [B, H, T, T]
+                    logits        = _out.logits                                            # [B, T, V]
+                    hidden_states = _out.hidden_states[-1] if need_hidden else None        # [B, T, d]
+                    attn_weights  = _out.attentions[cluster_attn_layer] if need_attn else None  # [B, H, T, T]
 
                 if suppress_tokens:
                     for tok in suppress_tokens:
@@ -409,21 +434,23 @@ class ClusterGuidedSampler(BaseSampler):
                     logits = torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
 
                 # ---- cluster-guided logit adjustment ----
-                # Average attention over heads: [B, H, T, T] -> [B, T, T]
-                attn_avg = attn_weights.mean(dim=1)  # [B, T, T]
+                # Average attention over heads only when we reclustered this step.
+                attn_avg = attn_weights.mean(dim=1) if recluster_now else None  # [B, T, T] or None
 
-                for j in range(B):
-                    valid_len = int(attention_mask[j].sum().item())
-                    logits[j] = self._compute_guidance_logits(
-                        hidden     = hidden_states[j],        # [T, d]
-                        logits     = logits[j],               # [T, V]
-                        attn       = attn_avg[j],             # [T, T]
-                        mask_index = mask_index[j],           # [T]
-                        valid_len  = valid_len,
-                        n_clusters = n_clusters,
-                        min_anchor_size = min_anchor_size,
-                        gamma      = gamma,
-                    )
+                if need_guidance:
+                    for j in range(B):
+                        valid_len = int(attention_mask[j].sum().item())
+                        logits[j], cached_labels[j] = self._compute_guidance_logits(
+                            hidden          = hidden_states[j],                    # [T, d]
+                            logits          = logits[j],                           # [T, V]
+                            mask_index      = mask_index[j],                       # [T]
+                            valid_len       = valid_len,
+                            n_clusters      = n_clusters,
+                            min_anchor_size = min_anchor_size,
+                            gamma           = gamma,
+                            attn            = attn_avg[j] if recluster_now else None,
+                            cached_labels   = None if recluster_now else cached_labels[j],
+                        )
 
                 # ---- token selection ----
                 logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
