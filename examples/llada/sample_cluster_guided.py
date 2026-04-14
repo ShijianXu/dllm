@@ -53,6 +53,7 @@ print("=" * 80)
 messages = [
     [{"role": "user", "content": "Lily runs 12 km/h for 4 hours. How far in 8 hours?"}],
     [{"role": "user", "content": "Please write an educational python function."}],
+    [{"role": "user", "content": "What is the capital of France?"}],
 ]
 
 inputs = tokenizer.apply_chat_template(
