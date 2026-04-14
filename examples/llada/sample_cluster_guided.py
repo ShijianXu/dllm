@@ -23,9 +23,9 @@ class ScriptArguments:
 
 @dataclass
 class SamplerConfig(dllm.core.samplers.ClusterGuidedSamplerConfig):
-    steps: int = 128
-    max_new_tokens: int = 128
-    block_size: int = 128
+    steps: int = 512 #128
+    max_new_tokens: int = 512 #128
+    block_size: int = 512 #128
     temperature: float = 0.0
     remasking: str = "low_confidence"
     n_clusters: int = 8
@@ -51,9 +51,9 @@ print("TEST: ClusterGuidedSampler.sample()".center(80))
 print("=" * 80)
 
 messages = [
-    [{"role": "user", "content": "Lily runs 12 km/h for 4 hours. How far in 8 hours?"}],
-    [{"role": "user", "content": "Please write an educational python function."}],
-    [{"role": "user", "content": "What nationality of the company that published Adventure Cyclist Magazine?"}],
+    # [{"role": "user", "content": "Lily runs 12 km/h for 4 hours. How far in 8 hours?"}],
+    # [{"role": "user", "content": "Please write an educational python function."}],
+    [{"role": "user", "content": "Alexis is applying for a new job and bought a new set of business clothes to wear to the interview. She went to a department store with a budget of $200 and spent $30 on a button-up shirt, $46 on suit pants, $38 on a suit coat, $11 on socks, and $18 on a belt. She also purchased a pair of shoes, but lost the receipt for them. She has $16 left from her budget. How much did Alexis pay for the shoes?"}],
 ]
 
 inputs = tokenizer.apply_chat_template(
