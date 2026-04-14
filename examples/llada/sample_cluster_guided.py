@@ -25,7 +25,7 @@ class ScriptArguments:
 class SamplerConfig(dllm.core.samplers.ClusterGuidedSamplerConfig):
     steps: int = 512 #128
     max_new_tokens: int = 512 #128
-    block_size: int = 512 #128
+    block_size: int = 128
     temperature: float = 0.0
     remasking: str = "low_confidence"
     n_clusters: int = 8
